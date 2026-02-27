@@ -380,18 +380,26 @@ def compute_shifts(refAndMasks, fr_reg, maxregshift=0.1, smooth_sigma_time=0,
         fr_reg = torch.clip(fr_reg, rmin, rmax) if rmin > -np.inf else fr_reg
 
         # rigid registration
-        ymax, xmax, cmax = rigid.phasecorr(fr_reg, cfRefImg, maskMul, maskOffset, 
+        ymax, xmax, cmax = rigid.phasecorr(fr_reg, cfRefImg, maskMul, maskOffset,
                                         maxregshift, smooth_sigma_time)[:3]
-            
+
+        # center rigid shifts so their median is zero
+        ymax = ymax - torch.median(ymax)
+        xmax = xmax - torch.median(xmax)
+
         # non-rigid registration
-        if maskMulNR is not None and maxregshiftNR > 0:     
+        if maskMulNR is not None and maxregshiftNR > 0:
             # shift torch frames to reference
             fr_reg = torch.stack([torch.roll(frame, shifts=(-dy, -dx), dims=(0, 1))
                                 for frame, dy, dx in zip(fr_reg, ymax, xmax)], axis=0)
-            ymax1, xmax1, cmax1 = nonrigid.phasecorr(fr_reg, blocks, 
-                                                    maskMulNR, maskOffsetNR, cfRefImgNR, 
+            ymax1, xmax1, cmax1 = nonrigid.phasecorr(fr_reg, blocks,
+                                                    maskMulNR, maskOffsetNR, cfRefImgNR,
                                                     snr_thresh, maxregshiftNR)[:3]
-        else:    
+
+            # center nonrigid shifts per block so each block's median is zero
+            ymax1 = ymax1 - torch.median(ymax1, dim=0).values
+            xmax1 = xmax1 - torch.median(xmax1, dim=0).values
+        else:
             ymax1, xmax1, cmax1 = None, None, None
 
         del fr_reg
