@@ -401,6 +401,13 @@ def save_nwb(save_folder):
         )
         # link to external data
         external_data = settings["filelist"] if "filelist" in settings else [""]
+        # total frames across all planes; pynwb>=3 requires num_samples when
+        # format="external" and timing is given by rate (nd2/sbx loaders store
+        # nframes in settings rather than db)
+        nframes_per_plane = [
+            db["nframes"] if "nframes" in db else s["nframes"]
+            for s, db in zip(settings1, dbs)
+        ]
         image_series = TwoPhotonSeries(
             name="TwoPhotonSeries",
             dimension=[dbs[0]["Ly"], dbs[0]["Lx"]],
@@ -410,6 +417,7 @@ def save_nwb(save_folder):
             format="external",
             starting_time=0.0,
             rate=settings["fs"] * dbs[0]["nplanes"],
+            num_samples=int(np.sum(nframes_per_plane)),
         )
         nwbfile.add_acquisition(image_series)
 
@@ -429,7 +437,7 @@ def save_nwb(save_folder):
         file_strs_chan2 = ["F_chan2.npy", "Fneu_chan2.npy"]
         traces, traces_chan2 = [], []
         ncells = np.zeros(len(settings1), dtype=np.int_)
-        Nfr = np.array([db["nframes"] for db in dbs]).max()
+        Nfr = max(nframes_per_plane)
         for iplane, (settings, db) in enumerate(zip(settings1, dbs)):
             if iplane == 0:
                 iscell = np.load(os.path.join(plane_folders[iplane], "iscell.npy"))
