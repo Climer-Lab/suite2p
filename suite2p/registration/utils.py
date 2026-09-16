@@ -4,8 +4,8 @@ Copyright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer a
 import numpy as np
 import cv2 
 from cellpose import transforms
-from scipy.ndimage import gaussian_filter1d
 import torch
+import torch.nn.functional as F
 
 try:
     # pytorch > 1.7
@@ -77,25 +77,43 @@ def spatial_taper(sig, Ly, Lx):
     return maskMul
 
 
-def temporal_smooth(data: np.ndarray, sigma: float) -> np.ndarray:
+def temporal_smooth(data: torch.Tensor, sigma: float) -> torch.Tensor:
     """
-    Apply 1D Gaussian smoothing along the time (first) axis of a 3D array.
+    Apply 1D Gaussian smoothing along the time (first) axis of a 3D tensor.
 
-    TODO: convert to torch
+    Matches scipy.ndimage.gaussian_filter1d with its default settings
+    (truncate=4.0, mode="reflect"), but runs in torch on the tensor's device.
 
     Parameters
     ----------
-    data : numpy.ndarray
+    data : torch.Tensor
         Input data of shape (nimg, Ly, Lx) to be smoothed along axis 0.
     sigma : float
         Standard deviation of the Gaussian kernel used for temporal smoothing.
 
     Returns
     -------
-    smoothed_data : numpy.ndarray
-        Temporally smoothed data of shape (nimg, Ly, Lx).
+    smoothed_data : torch.Tensor
+        Temporally smoothed data of shape (nimg, Ly, Lx), same dtype and device as `data`.
     """
-    return gaussian_filter1d(data, sigma=sigma, axis=0)
+    radius = int(4.0 * sigma + 0.5)
+    if sigma <= 0 or radius < 1:
+        return data
+
+    nimg, Ly, Lx = data.shape
+    dtype = data.dtype
+    x = torch.arange(-radius, radius + 1, device=data.device, dtype=torch.float32)
+    kernel = torch.exp(-0.5 * (x / sigma)**2)
+    kernel /= kernel.sum()
+
+    # half-sample symmetric ("reflect") padding indices, valid for radius >= nimg
+    inds = torch.arange(-radius, nimg + radius, device=data.device)
+    inds = inds % (2 * nimg)
+    inds = torch.where(inds >= nimg, 2 * nimg - 1 - inds, inds)
+
+    padded = data[inds].float().permute(1, 2, 0).reshape(Ly * Lx, 1, nimg + 2 * radius)
+    smoothed = F.conv1d(padded, kernel.view(1, 1, -1))
+    return smoothed.reshape(Ly, Lx, nimg).permute(2, 0, 1).contiguous().to(dtype)
 
 
 def complex_fft2(img):
