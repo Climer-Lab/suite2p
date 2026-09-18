@@ -391,9 +391,9 @@ def compute_shifts(refAndMasks, fr_reg, maxregshift=0.1, smooth_sigma_time=0,
         ymax, xmax, cmax = rigid.phasecorr(fr_reg, cfRefImg, maskMul, maskOffset,
                                         maxregshift, smooth_sigma_time)[:3]
 
-        # center rigid shifts so their median is zero
-        ymax = ymax - torch.median(ymax)
-        xmax = xmax - torch.median(xmax)
+        # NOTE: shifts are relative to the reference image. Median centering is
+        # done over the whole recording in register_frames (center_shifts), not
+        # here, because this function only sees one batch at a time.
 
         # non-rigid registration
         if maskMulNR is not None and maxregshiftNR > 0:
@@ -403,10 +403,6 @@ def compute_shifts(refAndMasks, fr_reg, maxregshift=0.1, smooth_sigma_time=0,
             ymax1, xmax1, cmax1 = nonrigid.phasecorr(fr_reg, blocks,
                                                     maskMulNR, maskOffsetNR, cfRefImgNR,
                                                     snr_thresh, maxregshiftNR)[:3]
-
-            # center nonrigid shifts per block so each block's median is zero
-            ymax1 = ymax1 - torch.median(ymax1, dim=0).values
-            xmax1 = xmax1 - torch.median(xmax1, dim=0).values
         else:
             ymax1, xmax1, cmax1 = None, None, None
 
@@ -500,7 +496,7 @@ def register_frames(f_align_in, refImg, f_align_out=None, batch_size=100,
                     block_size=(128,128), nonrigid=True, maxregshift=0.1,
                     smooth_sigma_time=0, snr_thresh=1.2, maxregshiftNR=5,
                     subpixel=10, device=torch.device("cuda"), tif_root=None, apply_shifts=True,
-                    upsample_meanImg=False):
+                    upsample_meanImg=False, center_shifts=True):
     """
     Register frames to a reference image using rigid and optionally nonrigid shifts.
 
@@ -508,6 +504,11 @@ def register_frames(f_align_in, refImg, f_align_out=None, batch_size=100,
     batches: computes shifts, applies them, accumulates a mean image, and
     optionally writes registered frames to f_align_out. Supports multi-plane
     registration when refImg is a list.
+
+    With ``center_shifts`` (and ``apply_shifts``) the shifts are first computed
+    for the whole recording, the median rigid shift and the per-block median
+    nonrigid shift are subtracted, and the centered shifts are applied in a
+    second pass over the input.
 
     Parameters
     ----------
@@ -553,6 +554,11 @@ def register_frames(f_align_in, refImg, f_align_out=None, batch_size=100,
         for both Y and X. If list/tuple of length 2, specifies [Y_factor, X_factor].
         The mean image is computed by accumulating registered frames at subpixel
         locations and normalizing by pixel counts.
+    center_shifts : bool
+        If True (and apply_shifts), subtract the median shift over all frames
+        (rigid; per block for nonrigid) before applying the shifts, so that the
+        registered movie sits at the median frame position. Requires a second
+        pass over the input frames.
 
     Returns
     -------
@@ -576,9 +582,15 @@ def register_frames(f_align_in, refImg, f_align_out=None, batch_size=100,
     meanImg_ups : np.ndarray or None
         Super-resolution mean image of shape (Ly*upsample[0], Lx*upsample[1])
         after Gaussian smoothing and normalization by counts. None if upsample_meanImg is False.
+    shift_medians : dict
+        Medians subtracted from the shifts, keys "yoff", "xoff" (ints) and
+        "yoff1", "xoff1" (arrays of length n_blocks, or None). All zero if
+        center_shifts is False or apply_shifts is False.
     """
 
     n_frames, Ly, Lx = f_align_in.shape
+    two_pass = bool(apply_shifts and center_shifts)
+    apply_in_loop = bool(apply_shifts and not two_pass)
 
     if isinstance(refImg, list):
         nZ = len(refImg)
@@ -627,10 +639,10 @@ def register_frames(f_align_in, refImg, f_align_out=None, batch_size=100,
                                  nZ=nZ)
         ymax, xmax, cmax, ymax1, xmax1, cmax1, zest, cmax_all = offsets
 
-        if apply_shifts:
-            frames = shift_frames(fr_torch, ymax, xmax, ymax1, xmax1, blocks, 
+        if apply_in_loop:
+            frames = shift_frames(fr_torch, ymax, xmax, ymax1, xmax1, blocks,
                                   mean_img_ups=mean_img_ups, counts_ups=counts_ups, device=device)
-            
+
         # convert to numpy and concatenate offsets
         ymax, xmax, cmax = ymax.cpu().numpy(), xmax.cpu().numpy(), cmax.cpu().numpy()
         if ymax1 is not None:
@@ -643,10 +655,11 @@ def register_frames(f_align_in, refImg, f_align_out=None, batch_size=100,
                         if n > 0 else offsets)
         
         # make mean image from all registered frames
-        mean_img += frames.sum(axis=0) / n_frames
+        if not two_pass:
+            mean_img += frames.sum(axis=0) / n_frames
 
         # save aligned frames to bin file
-        if apply_shifts:
+        if apply_in_loop:
             if f_align_out is not None:
                 f_align_out[tstart : tend] = frames
             else:
@@ -657,6 +670,25 @@ def register_frames(f_align_in, refImg, f_align_out=None, batch_size=100,
                 fname = os.path.join(tif_root, f"file{n : 05d}.tif")
                 save_tiff(mov=frames, fname=fname)
 
+    ### ------------- center shifts and apply in a second pass ------------ ###
+    yoff1_all = offsets_all[3]
+    nb = yoff1_all.shape[1] if yoff1_all is not None else 0
+    shift_medians = {"yoff": 0, "xoff": 0,
+                     "yoff1": np.zeros(nb, "float32") if nb else None,
+                     "xoff1": np.zeros(nb, "float32") if nb else None}
+    if two_pass:
+        offsets_all, shift_medians = center_offsets(offsets_all)
+        logger.info("Centered shifts: median rigid (y, x) = (%d, %d) px subtracted%s",
+                    shift_medians["yoff"], shift_medians["xoff"],
+                    "; per-block nonrigid medians subtracted" if nb else "")
+        mean_img = shift_frames_and_write(f_align_in, f_align_out, batch_size,
+                                          offsets_all[0], offsets_all[1],
+                                          offsets_all[3], offsets_all[4], blocks=blocks,
+                                          bidiphase=bidiphase, device=device,
+                                          tif_root=tif_root, mean_img_ups=mean_img_ups,
+                                          counts_ups=counts_ups,
+                                          msg="Applying centered shifts to")
+
     if upsample_meanImg:
         # apply Gaussian smoothing and normalize by counts
         mimg = mean_img_ups.cpu().numpy()
@@ -666,7 +698,43 @@ def register_frames(f_align_in, refImg, f_align_out=None, batch_size=100,
         cimg = gaussian_filter(cimg, sig)
         meanImg_ups = mimg / cimg
 
-    return rmin, rmax, mean_img, offsets_all, blocks, mean_img_ups, counts_ups, meanImg_ups
+    return (rmin, rmax, mean_img, offsets_all, blocks, mean_img_ups, counts_ups, meanImg_ups,
+            shift_medians)
+
+
+def center_offsets(offsets_all):
+    """
+    Subtract the median shift over all frames from rigid and nonrigid offsets.
+
+    Parameters
+    ----------
+    offsets_all : list
+        [yoff, xoff, corrXY, yoff1, xoff1, corrXY1, zest, cmax_all] as returned
+        by register_frames; yoff1/xoff1 may be None.
+
+    Returns
+    -------
+    offsets_all : list
+        Same list with yoff, xoff (integer medians) and each block of yoff1,
+        xoff1 (per-block medians) centered so their median over frames is zero.
+    shift_medians : dict
+        The subtracted medians: "yoff", "xoff" (int), "yoff1", "xoff1"
+        (arrays of length n_blocks, or None).
+    """
+    yoff, xoff, corrXY, yoff1, xoff1, corrXY1, zest, cmax_all = offsets_all
+    ymed = int(np.round(np.median(yoff)))
+    xmed = int(np.round(np.median(xoff)))
+    yoff = yoff - ymed
+    xoff = xoff - xmed
+    if yoff1 is not None:
+        ymed1 = np.median(yoff1, axis=0).astype(yoff1.dtype)
+        xmed1 = np.median(xoff1, axis=0).astype(xoff1.dtype)
+        yoff1 = yoff1 - ymed1
+        xoff1 = xoff1 - xmed1
+    else:
+        ymed1, xmed1 = None, None
+    offsets_all = [yoff, xoff, corrXY, yoff1, xoff1, corrXY1, zest, cmax_all]
+    return offsets_all, {"yoff": ymed, "xoff": xmed, "yoff1": ymed1, "xoff1": xmed1}
 
 def check_offsets(yoff, xoff, yoff1, xoff1, n_frames):
     """
@@ -701,14 +769,16 @@ def check_offsets(yoff, xoff, yoff1, xoff1, n_frames):
                 "nonrigid registration offsets are not the same size as input frames")
 
 def shift_frames_and_write(f_alt_in, f_alt_out=None, batch_size=100, yoff=None, xoff=None, yoff1=None,
-                           xoff1=None, blocks=None, bidiphase=0, 
-                           device=torch.device("cuda"), tif_root=None):
+                           xoff1=None, blocks=None, bidiphase=0,
+                           device=torch.device("cuda"), tif_root=None,
+                           mean_img_ups=None, counts_ups=None, msg="Second channel: Shifting"):
     """
-    Apply pre-computed registration shifts to an alternate channel and write results.
+    Apply pre-computed registration shifts to frames and write results.
 
-    Applies rigid (and optionally nonrigid) shifts that were computed on the
-    primary channel to the alternate channel frames, in batches. Writes the
-    shifted frames to f_alt_out if provided, otherwise overwrites f_alt_in.
+    Applies rigid (and optionally nonrigid) shifts, in batches, to the frames of
+    an alternate channel (or, for centered shifts, to the primary channel in a
+    second pass). Writes the shifted frames to f_alt_out if provided, otherwise
+    overwrites f_alt_in.
 
     Parameters
     ----------
@@ -734,11 +804,17 @@ def shift_frames_and_write(f_alt_in, f_alt_out=None, batch_size=100, yoff=None, 
         Torch device for computation.
     tif_root : str or None
         If provided, save shifted frames as tiffs in this directory.
+    mean_img_ups : torch.Tensor or None
+        Accumulator for the upsampled mean image (see register_frames).
+    counts_ups : torch.Tensor or None
+        Pixel-count accumulator for the upsampled mean image.
+    msg : str
+        Prefix of the progress log message.
 
     Returns
     -------
     mean_img : np.ndarray
-        Mean image of the shifted alternate channel, shape (Ly, Lx).
+        Mean image of the shifted frames, shape (Ly, Lx).
     """
     n_frames, Ly, Lx = f_alt_in.shape
     check_offsets(yoff, xoff, yoff1, xoff1, n_frames)
@@ -746,7 +822,7 @@ def shift_frames_and_write(f_alt_in, f_alt_out=None, batch_size=100, yoff=None, 
     mean_img = np.zeros((Ly, Lx), "float32")
     yoff1k, xoff1k = None, None
     n_batches = int(np.ceil(n_frames / batch_size))
-    logger.info(f"Second channel: Shifting {n_frames} frames in {n_batches} batches")
+    logger.info(f"{msg} {n_frames} frames in {n_batches} batches")
     tqdm_out = TqdmToLogger(logger, level=logging.INFO)
     for n in trange(n_batches, mininterval=10, file=tqdm_out):
         tstart, tend = n * batch_size, min((n+1) * batch_size, n_frames)
@@ -762,7 +838,8 @@ def shift_frames_and_write(f_alt_in, f_alt_out=None, batch_size=100, yoff=None, 
 
         if bidiphase != 0:
             fr_torch = bidi.shift(fr_torch, bidiphase)
-        frames = shift_frames(fr_torch, yoffk, xoffk, yoff1k, xoff1k, blocks, device=device)
+        frames = shift_frames(fr_torch, yoffk, xoffk, yoff1k, xoff1k, blocks,
+                              mean_img_ups=mean_img_ups, counts_ups=counts_ups, device=device)
         mean_img += frames.sum(axis=0) / n_frames
 
         if f_alt_out is None:
@@ -964,8 +1041,10 @@ def registration_wrapper(f_reg, f_raw=None, f_reg_chan2=None, f_raw_chan2=None,
                                 maxregshift=settings["maxregshift"], smooth_sigma_time=settings["smooth_sigma_time"],
                                 snr_thresh=settings["snr_thresh"], maxregshiftNR=settings["maxregshiftNR"],
                                 subpixel=settings["subpixel"],
-                                device=device, upsample_meanImg=settings.get("upsample_meanImg", False))
-        rmin, rmax, mean_img, offsets_all, blocks, mean_img_ups, counts_ups, meanImg_ups = outputs
+                                device=device, upsample_meanImg=settings.get("upsample_meanImg", False),
+                                center_shifts=settings.get("center_shifts", True))
+        (rmin, rmax, mean_img, offsets_all, blocks, mean_img_ups, counts_ups, meanImg_ups,
+         shift_medians) = outputs
         yoff, xoff, corrXY, yoff1, xoff1, corrXY1, zest, cmax_all = offsets_all
 
         # compute valid region and timepoints to exclude
@@ -1002,6 +1081,10 @@ def registration_wrapper(f_reg, f_raw=None, f_reg_chan2=None, f_raw_chan2=None,
                                                badframes, badframes0,
                                                yrange, xrange, bidiphase, 
                                                )
+
+    # medians subtracted from the shifts (all zero unless center_shifts)
+    for k, v in shift_medians.items():
+        reg_outputs[f"{k}_median"] = v
 
     # add enhanced mean image
     meanImgE = utils.highpass_mean_image(meanImg.astype("float32"), aspect=aspect)

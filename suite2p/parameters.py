@@ -479,6 +479,14 @@ SETTINGS = {
             "default": False,
             "description": "Whether or not to run registration twice (useful for low SNR data). Set keep_movie_raw to True if setting this parameter to True.",
         },
+        "center_shifts": {
+            "gui_name": "Center shifts (median = 0)",
+            "type": bool,
+            "min": None,
+            "max": None,
+            "default": True,
+            "description": "Subtract the median shift over the whole recording (rigid, and per block for nonrigid) before applying shifts, so the registered movie sits at the median frame position rather than at the reference image position. Requires a second pass over the input.",
+        },
         "reg_tif": {
             "gui_name": "Save registered tiffs",
             "type": bool,
