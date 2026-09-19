@@ -215,9 +215,10 @@ def set_default_db(DB, db):
 def set_default_settings(SETTINGS, settings):
     for key in SETTINGS.keys():
         if "gui_name" not in SETTINGS[key]:
-            set_default_settings(SETTINGS[key], settings[key])
-        else:
-            SETTINGS[key]["default"] = settings[key]   
+            set_default_settings(SETTINGS[key], settings.get(key, {}))
+        elif key in settings:
+            # keys missing from an older saved settings file keep their default
+            SETTINGS[key]["default"] = settings[key]
             del settings[key]
 
 ### custom QMainWindow which allows user to fill in settings and run suite2p!

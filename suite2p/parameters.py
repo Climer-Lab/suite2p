@@ -479,6 +479,14 @@ SETTINGS = {
             "default": False,
             "description": "Whether or not to run registration twice (useful for low SNR data). Set keep_movie_raw to True if setting this parameter to True.",
         },
+        "center_shifts": {
+            "gui_name": "Center shifts (median = 0)",
+            "type": bool,
+            "min": None,
+            "max": None,
+            "default": True,
+            "description": "Subtract the median shift over the whole recording (rigid, and per block for nonrigid) before applying shifts, so the registered movie sits at the median frame position rather than at the reference image position. Requires a second pass over the input.",
+        },
         "reg_tif": {
             "gui_name": "Save registered tiffs",
             "type": bool,
@@ -908,11 +916,22 @@ def default_settings():
     settings["version"] = version  
     return settings
 
+def _merge_settings(defaults, overrides):
+    """ recursively overlay overrides on defaults, so keys added to the
+    defaults after a user settings file was saved are still present """
+    merged = dict(defaults)
+    for k, v in overrides.items():
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            merged[k] = _merge_settings(merged[k], v)
+        else:
+            merged[k] = v
+    return merged
+
 def user_settings():
     """ user-default options to run pipeline """
     if (SETTINGS_FOLDER / "settings_user.npy").exists():
         settings = np.load(SETTINGS_FOLDER / "settings_user.npy", allow_pickle=True).item()
-        settings = {**default_settings(), **settings}
+        settings = _merge_settings(default_settings(), settings)
     else:
         settings = default_settings()
     return settings
