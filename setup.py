@@ -10,16 +10,22 @@ install_deps = ["importlib-metadata",
         "scipy>=1.9.0",
         "scikit-learn",
         "cellpose>=4.0.1",
-        "scanimage-tiff-reader>=1.4.1"
+        "scanimage-tiff-reader>=1.4.1",
+        "tqdm",
+        "opencv-python-headless",
         ]
 
-gui_deps = [
+# GUI packages that work with any Qt binding (PyQt5/6, PySide2/6 via qtpy).
+gui_noqt_deps = [
         "qtpy",
         "superqt",
-        "pyqt6",
-        "pyqt6.sip",
         "pyqtgraph",
         "rastermap>=0.9.0",
+      ]
+
+gui_deps = gui_noqt_deps + [
+        "pyqt6",
+        "pyqt6.sip",
       ]
 
 io_deps = [
@@ -44,7 +50,11 @@ test_deps = [
       "pytest-qt>3.3.0",
 ]
 
-# check if pyqt/pyside already installed
+# check if pyqt/pyside already installed. NOTE: pip builds metadata in an
+# isolated environment, where these imports always fail, so this only takes
+# effect with --no-build-isolation. To keep an existing binding (e.g. conda-forge
+# PySide6, needed in conda envs where the PyQt6 wheel picks up conda's ICU and
+# fails to load), install the "gui-noqt" extra instead of "gui".
 try:
     import PyQt5
     gui_deps.remove("pyqt6")
@@ -105,6 +115,7 @@ setuptools.setup(
         "mkdocstrings-python"
       ],
       "gui": gui_deps,
+      "gui-noqt": gui_noqt_deps,
       "nwb": nwb_deps,
       "io": io_deps,
       "test": test_deps,
